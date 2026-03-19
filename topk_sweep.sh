@@ -84,4 +84,4 @@ python ./summarize_topk_sweep.py \
 echo "========================================================"
 echo "Saved times CSV:   ${TIMES_CSV}"
 echo "Saved final CSV:   ${FINAL_CSV}"
-echo "Saved plot PNG:    ${PLOT_PNG}"
+echo "Saved plot PNG:    ${PLOT_PNG}" 
