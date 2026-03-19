@@ -16,7 +16,6 @@ PLOT_PNG="${OUTROOT}/topk_vs_avg_qwk.png"
 mkdir -p "${OUTROOT}"
 echo "k,seconds,status,out_dir" > "${TIMES_CSV}"
 
-# ---- Your custom K list ----
 K_LIST=(1 3 5 10 20 50 768)
 TOTAL=${#K_LIST[@]}
 
@@ -36,11 +35,10 @@ for idx in "${!K_LIST[@]}"; do
   OUTDIR="${OUTROOT}/k${K}"
   mkdir -p "${OUTDIR}"
 
-  echo "==================== [${i}/${TOTAL}] Running K=${K} ===================="
+  echo "=== [${i}/${TOTAL}] Running K=${K} ==="
 
   start_ts=$(date +%s)
 
-  # Line-buffer output so you see epoch prints immediately
   stdbuf -oL -eL python -u "${SCRIPT}" \
     --asap_path "${ASAP}" \
     --prompt_id 0 \
@@ -81,7 +79,6 @@ python ./summarize_topk_sweep.py \
   --out_csv "${FINAL_CSV}" \
   --plot_png "${PLOT_PNG}"
 
-echo "========================================================"
 echo "Saved times CSV:   ${TIMES_CSV}"
 echo "Saved final CSV:   ${FINAL_CSV}"
 echo "Saved plot PNG:    ${PLOT_PNG}" 
