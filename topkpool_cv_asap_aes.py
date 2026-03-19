@@ -1,54 +1,22 @@
 #!/usr/bin/env python3
-"""
-r2bert_topkpool_cv.py
-
-R2BERT (Regression + Ranking with dynamic weights) BUT with representation swapped:
-
-Original R2BERT representation (paper):
-  r = h[CLS]  (CLS vector)
-
-This script (your requested change):
-  r = Top-K avg pooled per dimension over last_hidden_state token vectors
-      (padding ignored; CLS token excluded by default)
-
-Pipeline per prompt (essay_set):
-- 5-fold CV (60/20/20): for each fold:
-    - Train: 60%, Val: 20%, Test: 20%
-- Fine-tune BERT with combined loss:
-    L = tau(e)*Lm + (1-tau(e))*Lr
-    - Lm = MSE on normalized scores in [0,1]
-    - Lr = batchwise ListNet (top-1 distribution) CE(P_true || P_pred)
-    - tau(e) increases over epochs (dynamic weights)
-- Evaluate on TEST by denormalizing back to the prompt’s score range and computing QWK.
-
-Run examples are at the bottom of this file.
-"""
-
 from __future__ import annotations
-
 import argparse
 import math
 import os
 import random
 from dataclasses import dataclass
 from typing import Dict, List, Tuple
-
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-
 from transformers import AutoTokenizer, AutoModel
-
-# sklearn is used only for split helpers; metrics are implemented locally
 from sklearn.model_selection import KFold, train_test_split
 
 
-# -------------------------
-# Repro / device
-# -------------------------
+#Device:--
 def set_seed(seed: int):
     random.seed(seed)
     np.random.seed(seed)
@@ -63,10 +31,9 @@ def get_device():
         return torch.device("mps")
     return torch.device("cpu")
 
+#------
+#Score normalization per prompt:--
 
-# -------------------------
-# Score normalization (prompt-specific)
-# -------------------------
 def minmax_norm(y: float, y_min: float, y_max: float) -> float:
     denom = (y_max - y_min)
     if denom <= 1e-12:
@@ -78,9 +45,9 @@ def minmax_unnorm(y_norm: float, y_min: float, y_max: float) -> float:
     return float(y_norm * (y_max - y_min) + y_min)
 
 
-# -------------------------
-# QWK (quadratic weighted kappa)
-# -------------------------
+#------
+#QWK:--
+
 def quadratic_weighted_kappa(y_true, y_pred, min_rating=None, max_rating=None):
     y_true = np.asarray(y_true, dtype=int)
     y_pred = np.asarray(y_pred, dtype=int)
@@ -122,9 +89,9 @@ def mae_rmse(y_true: np.ndarray, y_pred: np.ndarray):
     return float(np.mean(np.abs(err))), float(np.sqrt(np.mean(err ** 2)))
 
 
-# -------------------------
-# Dataset
-# -------------------------
+#------
+#Dataset:--
+
 class ASAPDataset(Dataset):
     def __init__(self, df: pd.DataFrame, y_min: float, y_max: float):
         self.df = df.reset_index(drop=True)
@@ -155,14 +122,11 @@ def collate_batch(batch):
     }
 
 
-# -------------------------
-# AMP compatibility (new torch.amp vs old torch.cuda.amp)
-# -------------------------
+#------
+# AMP compatibility:--
+
 def get_amp_components(device: torch.device):
-    """
-    Returns (autocast_ctx, scaler) compatible across torch versions.
-    autocast_ctx is a context manager factory: autocast_ctx(enabled=True).
-    """
+    
     if device.type != "cuda":
         class Dummy:
             def __init__(self, enabled=False): pass
@@ -188,69 +152,51 @@ def get_amp_components(device: torch.device):
         return (lambda enabled=False: old_autocast(enabled=enabled)), OldGradScaler(enabled=True)
 
 
-# -------------------------
-# Top-K avg pooling per dimension (padding ignored, CLS excluded)
-# -------------------------
+#------
+# Top-K avg pooling per dimension:--
+
 def topk_avg_pool_per_dim(
-    last_hidden: torch.Tensor,          # (B,L,H)
-    attention_mask: torch.Tensor,       # (B,L) 1=token, 0=pad
+    last_hidden: torch.Tensor,          
+    attention_mask: torch.Tensor,       
     k: int = 10,
     exclude_cls: bool = True,
 ) -> torch.Tensor:
     """
-    For each sample and each hidden dimension j:
-      pooled_j = mean(top-K token values along sequence dimension)
-
-    - pads ignored
-    - CLS excluded by default
+    for each sample the mean of top k is taken excluding cls and padding
     """
     B, L, H = last_hidden.shape
     k = int(min(k, L))
 
-    # boolean mask for valid positions
-    mask = attention_mask.to(dtype=torch.bool)  # (B,L)
+    mask = attention_mask.to(dtype=torch.bool) 
     if exclude_cls and L > 0:
         mask = mask.clone()
         mask[:, 0] = False
 
-    # use float32 for stable topk (even under amp)
     x = last_hidden.float()
 
-    # set invalid tokens to a large negative so they don't appear in topk
+    #setting invalid tokens to a large negative so they don't appear in topk and disrupt the mean k pooling
     very_neg = torch.tensor(-1e9, device=x.device, dtype=x.dtype)
-    x = x.masked_fill(~mask.unsqueeze(-1), very_neg)  # (B,L,H)
-
-    vals, _ = torch.topk(x, k=k, dim=1)  # (B,k,H)
-
-    # count how many of the topk values are actually valid (for very short sequences)
+    x = x.masked_fill(~mask.unsqueeze(-1), very_neg) 
+    vals, _ = torch.topk(x, k=k, dim=1)  
     valid = vals > -5e8
-    denom = valid.sum(dim=1).clamp(min=1)  # (B,H)
-    pooled = (vals * valid).sum(dim=1) / denom  # (B,H)
+    denom = valid.sum(dim=1).clamp(min=1) 
+    pooled = (vals * valid).sum(dim=1) / denom 
 
     return pooled.to(dtype=last_hidden.dtype)
 
 
-# -------------------------
-# Batchwise ListNet (top-1) loss
-# -------------------------
+#------
+#Batchwise ListNet loss:--
+
 def listnet_top1_ce(y_true: torch.Tensor, y_pred: torch.Tensor) -> torch.Tensor:
-    """
-    Standard ListNet top-1 distribution cross-entropy in a batch:
-
-      P_true = softmax(y_true)
-      P_pred = softmax(y_pred)
-      L = - sum_j P_true(j) * log(P_pred(j))
-
-    y_true, y_pred are (B,) normalized scores in [0,1].
-    """
     p_true = torch.softmax(y_true, dim=0)
     log_p_pred = torch.log_softmax(y_pred, dim=0)
     return -(p_true * log_p_pred).sum()
 
 
-# -------------------------
-# Dynamic weights tau(e)
-# -------------------------
+#------
+#Dynamic weights tau:--
+
 def compute_gamma_for_tau1(num_epochs: int, tau1: float = 1e-6) -> float:
     """
     Paper chooses gamma so that tau(1) ~= 1e-6 for their E.
@@ -271,9 +217,9 @@ def tau_e(epoch_1based: int, num_epochs: int, gamma: float) -> float:
     return float(1.0 / (1.0 + math.exp(gamma * (E / 2.0 - e))))
 
 
-# -------------------------
-# Model: BERT + pooling + linear head (+ sigmoid)
-# -------------------------
+#------
+#Model:--
+
 class R2BERTTopKPool(nn.Module):
     def __init__(self, model_name: str, top_k_pool: int = 10, exclude_cls: bool = True):
         super().__init__()
@@ -302,9 +248,9 @@ class R2BERTTopKPool(nn.Module):
         return y_hat
 
 
-# -------------------------
-# Train / Eval
-# -------------------------
+#------
+#Training:--
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -433,9 +379,9 @@ def eval_on_split(
     }
 
 
-# -------------------------
-# CV split (5-fold -> 60/20/20)
-# -------------------------
+#------
+#CV (5-fold):--
+
 def make_cv_splits(df_prompt: pd.DataFrame, n_splits: int, seed: int):
     """
     For each fold:
@@ -455,9 +401,9 @@ def make_cv_splits(df_prompt: pd.DataFrame, n_splits: int, seed: int):
         yield fold, train_idx, val_idx, test_idx
 
 
-# -------------------------
-# Main
-# -------------------------
+#------
+# Main:--
+
 def main():
     ap = argparse.ArgumentParser()
 
@@ -676,9 +622,8 @@ if __name__ == "__main__":
     main()
 
 """
-Example runs:
 
-1) Run ALL prompts (1..8), 5-fold CV, default 30 epochs (paper-like):
+To Run ALL prompts (1..8), 5-fold CV, default 30 epochs:
 python r2bert_topkpool_cv.py \
   --asap_path Multi-scale/asap-aes/training_set_rel3.tsv \
   --model_name bert-base-uncased \
@@ -691,18 +636,5 @@ python r2bert_topkpool_cv.py \
   --out_dir Multi-scale/out_r2bert_topkpool \
   --amp
 
-2) Run ONLY prompt 7 with 80 epochs:
-python r2bert_topkpool_cv.py \
-  --asap_path Multi-scale/asap-aes/training_set_rel3.tsv \
-  --model_name bert-base-uncased \
-  --prompt_id 7 \
-  --cv_folds 5 \
-  --num_epochs 80 \
-  --top_k_pool 10 \
-  --batch_size 16 \
-  --lr 2e-5 \
-  --out_dir Multi-scale/out_r2bert_topkpool_p7_80ep \
-  --amp
-"""
 
 
